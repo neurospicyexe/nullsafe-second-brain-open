@@ -1,0 +1,40 @@
+{
+  "name": "nullsafe-second-brain",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "dev:http": "tsx src/index-http.ts",
+    "build": "tsc",
+    "start": "node --env-file=.env dist/index.js",
+    "start:http": "node --env-file=.env dist/index-http.js",
+    "rebuild": "tsx scripts/rebuild-index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "node-cron": "^4.2.1",
+    "octagonal-wheels": "^0.1.45",
+    "sqlite-vec": "^0.1.9",
+    "xxhash-wasm": "^1.1.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

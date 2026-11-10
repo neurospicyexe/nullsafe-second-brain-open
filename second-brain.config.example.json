@@ -1,0 +1,33 @@
+{
+  "vault": { "adapter": "filesystem", "path": "/path/to/your/obsidian/vault" },
+  "obsidian_rest": { "url": "http://localhost:27123", "api_key": "" },
+  "halseth": { "url": "https://your-halseth.workers.dev", "secret": "" },
+  "plural": { "enabled": false, "mcp_url": "" },
+  "companions": [
+    { "id": "companion-a", "role": "companion", "vault_folder": "companions/companion-a/" },
+    { "id": "companion-b", "role": "audit", "vault_folder": "companions/companion-b/" },
+    { "id": "companion-c", "role": "companion", "vault_folder": "companions/companion-c/" }
+  ],
+  "triggers": {
+    "scheduled": { "enabled": false, "cron": "0 22 * * *" },
+    "on_demand": true,
+    "event_driven": { "enabled": false, "on_session_close": true, "on_handover": true }
+  },
+  "routing": [
+    { "companion": "companion-a", "type": "document", "destination": "companions/companion-a/" },
+    { "companion": "companion-b", "type": "document", "destination": "companions/companion-b/" },
+    { "companion": "companion-c", "type": "document", "destination": "companions/companion-c/" },
+    { "type": "observation", "destination": "principal/" },
+    { "type": "session_summary", "destination": "principal/" }
+  ],
+  "patterns": { "enabled": true, "hearth_summary": true, "hearth_summary_path": "nullsafe/nullsystem/_recent-patterns.md" },
+  "embeddings": { "provider": "openai", "model": "text-embedding-3-small", "api_key": "" },
+  "http": { "port": 3001, "api_key": "replace-with-a-strong-random-secret", "public_url": "https://your-domain.example.com" },
+  "couchdb": {
+    "url": "http://localhost:5984",
+    "db": "obsidian-vault",
+    "username": "admin",
+    "password": "your-password",
+    "device_id": "nullsafe-mcp-server"
+  }
+}

@@ -1,0 +1,88 @@
+export type SourceType =
+  | 'synthesis_summary'
+  | 'relational_delta'
+  | 'feeling'
+  | 'companion_journal'
+  | 'inter_companion_note'
+  | 'handoff'
+  | 'historical_corpus'
+  | 'claude_export'
+  | 'wound'
+  | 'companion_dream'
+  | 'open_loop'
+  | 'relational_state'
+  | 'tension'
+  | 'growth_journal'
+  | 'companion_conclusion'
+  | 'somatic_snapshot'
+  | 'drift_log'
+  | 'live_thread'
+  | 'basin_history'
+  | 'ledger'
+  | 'wm_continuity_notes'
+
+export interface IngestRecord {
+  id: number
+  source_type: SourceType
+  /**
+   * Serialized JSON of the raw record -- EXCEPT 'ledger' (2026-09-26, imp-lane), where it is the
+   * ledger line itself (`〔ledger · <function> · <date>〕 ... Source: ...`), indexed verbatim with no
+   * wrap preamble, so the mark survives indexing.
+   */
+  content: string
+  created_at: string     // ISO timestamp
+  /**
+   * What the high-water mark advances on, when the feed supplies one (halseth tray pass 2,
+   * 2026-09-26). companion_journal: halseth's `cursor_at` = COALESCE(reviewed_at, created_at) -- the
+   * moment a row became memory -- so a draft kept after the mark is still pulled. Absent (an older
+   * halseth, or any other source): the mark advances on created_at, as it always has.
+   */
+  cursor?: string
+  /**
+   * The feed's tiebreak key at `cursor` (2026-09-26, ledger): the pipeline persists it as
+   * `<source>.after_id` beside the mark and hands it back to the puller, so a strictly-after feed never
+   * loses rows that share a cursor at a page boundary. Absent: no tiebreak (every other source).
+   */
+  cursor_id?: string
+  companion_id?: string  // cypher | drevan | gaia | null (cross-companion)
+  thread_key?: string
+  /**
+   * Set by a puller for a row it REFUSES to index (2026-09-26, ledger review S2): the pipeline advances the
+   * mark (and after_id) past it and indexes nothing. Without this, a refused row was simply dropped, the
+   * mark never moved past it, and a page made only of refused rows stalled its feed forever.
+   */
+  skip?: 'unmarked'
+}
+
+export interface HwmMap {
+  [source: string]: string // source_type -> ISO timestamp of last successful index
+}
+
+export interface IngestionConfig {
+  halsethUrl: string
+  halsethSecret: string
+  deepseekApiKey: string       // direct DeepSeek EMERGENCY lane ('' when unset); DeepInfra key is DEEPINFRA_API_KEY
+  deepseekModel: string        // default: 'deepseek-v4-flash' (per-vendor ids resolved in deepseek-client.ts)
+  cronSchedule: string         // default: '*/20 * * * *'
+  concurrencyLimit: number     // for corpus backfill, default: 3
+  concurrencyDelayMs: number   // default: 500
+  embeddingBatchSize: number   // default: 20
+  hwmPath: string              // path to data/hwm.json
+  evaluatorCronSchedule: string      // default: '0 */6 * * *' (every 6h)
+  sitPromptCronSchedule: string      // default: '0 */12 * * *' (twice daily)
+  patternSynthCronSchedule: string   // default: '0 2 * * 0' (Sunday 2am)
+  personaFeederCronSchedule: string  // default: '30 */6 * * *' (30min before evaluator)
+  corpusIntakeDir?: string           // optional: folder of .md files for recurring corpus backfill (recursive)
+  corpusCronSchedule?: string        // default: '0 */6 * * *' (every 6h); only fires if corpusIntakeDir is set
+  vaultMaterializerCronSchedule?: string  // default: '*/30 * * * *' (every 30m); pulls unmaterialized growth rows and writes .md files
+  thoughtformDetectorCronSchedule?: string // default: '0 3 * * *' (daily 3am UTC); POSTs /mind/growth/thoughtforms/detect
+  // INBOX auto-filer (2026-06-13). OFF by default -- Principal flips INBOX_FILER=true
+  // after a dry-run. hybrid: auto-file >= confidence, queue the rest for one-tap approval.
+  inboxFilerEnabled?: boolean              // INBOX_FILER (default false)
+  inboxFilerMode?: 'hybrid' | 'auto' | 'suggest'  // INBOX_FILER_MODE (default 'hybrid')
+  inboxFilerConfidence?: number            // INBOX_FILER_CONFIDENCE (default 0.75)
+  inboxFilerCronSchedule?: string          // INBOX_FILER_CRON (default '15 * * * *', hourly)
+  // Recall reconcile (2026-09-26): minutes between FULL sweeps of halseth's recall-ineligible list;
+  // incremental passes ride every ingestion tick. 0 = full every tick. (recall-reconcile.ts)
+  recallReconcileFullMinutes?: number      // RECALL_RECONCILE_FULL_MINUTES (default 60)
+}

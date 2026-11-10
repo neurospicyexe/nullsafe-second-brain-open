@@ -1,0 +1,26 @@
+node_modules/
+dist/
+second-brain.config.json
+*.db
+*.db-shm
+*.db-wal
+.env
+coverage/
+
+# Claude Code project memory
+.claude/
+
+# Private docs
+docs/private/
+
+# Personal operational docs -- contain VPS IPs, SSH config, credentials
+docs/how-to.md
+docs/how-to*.md
+docs/deploy*.md
+# deployment.md is the systemd runbook CLAUDE.md points at: aliases + unit only, no IPs, no credentials.
+!docs/deployment.md
+*-checklist.md
+*_CHECKLIST.md
+OPS-*.md
+DEPLOY_NOTES*.md
+.serena/

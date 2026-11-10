@@ -1,0 +1,55 @@
+import path from 'path'
+import { fileURLToPath } from 'url'
+import type { IngestionConfig } from './types.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+export function loadIngestionConfig(): IngestionConfig {
+  const halsethUrl = process.env.HALSETH_URL
+  const halsethSecret = process.env.HALSETH_SECRET
+  // DEEPSEEK_API_KEY is the direct-platform EMERGENCY lane; DEEPINFRA_API_KEY is primary and is
+  // read at call time by deepseek-client.ts. Either one is enough to run ingestion.
+  const deepseekApiKey = process.env.DEEPSEEK_API_KEY ?? ''
+  const deepinfraApiKey = process.env.DEEPINFRA_API_KEY
+
+  if (!halsethUrl) throw new Error('HALSETH_URL env var is required for ingestion')
+  if (!halsethSecret) throw new Error('HALSETH_SECRET env var is required for ingestion')
+  if (!deepseekApiKey && !deepinfraApiKey) {
+    throw new Error('DEEPINFRA_API_KEY (primary) or DEEPSEEK_API_KEY (fallback) env var is required for ingestion')
+  }
+
+  // Resolve hwm path relative to this file: src/ingestion/ -> src/ -> project root -> data/hwm.json
+  const hwmPath = path.resolve(__dirname, '../../data/hwm.json')
+
+  return {
+    halsethUrl,
+    halsethSecret,
+    deepseekApiKey,
+    deepseekModel: process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash',
+    cronSchedule: process.env.INGESTION_CRON ?? '*/20 * * * *',
+    concurrencyLimit: parseInt(process.env.INGESTION_CONCURRENCY ?? '3', 10),
+    concurrencyDelayMs: parseInt(process.env.INGESTION_DELAY_MS ?? '500', 10),
+    embeddingBatchSize: parseInt(process.env.EMBEDDING_BATCH_SIZE ?? '20', 10),
+    hwmPath,
+    evaluatorCronSchedule: process.env.EVALUATOR_CRON ?? '0 */6 * * *',
+    sitPromptCronSchedule: process.env.SIT_PROMPT_CRON ?? '0 */12 * * *',
+    patternSynthCronSchedule: process.env.PATTERN_SYNTH_CRON ?? '0 2 * * 0',
+    personaFeederCronSchedule: process.env.PERSONA_FEEDER_CRON ?? '30 */6 * * *',
+    corpusIntakeDir: process.env.CORPUS_INTAKE_DIR,
+    corpusCronSchedule: process.env.CORPUS_CRON ?? '0 */6 * * *',
+    vaultMaterializerCronSchedule: process.env.VAULT_MATERIALIZER_CRON ?? '*/30 * * * *',
+    thoughtformDetectorCronSchedule: process.env.THOUGHTFORM_CRON ?? '0 3 * * *',
+    inboxFilerEnabled: process.env.INBOX_FILER === 'true',
+    inboxFilerMode: (process.env.INBOX_FILER_MODE as 'hybrid' | 'auto' | 'suggest') ?? 'hybrid',
+    inboxFilerConfidence: parseFloat(process.env.INBOX_FILER_CONFIDENCE ?? '0.75'),
+    inboxFilerCronSchedule: process.env.INBOX_FILER_CRON ?? '15 * * * *',
+    recallReconcileFullMinutes: parseRecallReconcileMinutes(process.env.RECALL_RECONCILE_FULL_MINUTES),
+  }
+}
+
+/** Minutes between full recall-reconcile sweeps; unset/garbage = 60, negative clamps to 0 (every tick). */
+export function parseRecallReconcileMinutes(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 60
+  const n = Number(raw)
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 60
+}

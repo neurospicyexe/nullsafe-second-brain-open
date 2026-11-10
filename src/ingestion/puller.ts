@@ -1,0 +1,800 @@
+import type { IngestRecord, IngestionConfig, SourceType } from './types.js'
+
+export interface PullerResult {
+  records: IngestRecord[]
+  error?: string
+}
+
+// afterId (2026-09-26, ledger integration): the id of the last row indexed AT the `since` cursor, for a
+// feed that is strictly-after on its cursor and tie-breaks on id (halseth /ingest/ledger). Without it, rows
+// sharing a cursor_at at a page boundary are lost. Pullers whose feed has no tiebreak ignore it.
+type PullFn = (config: IngestionConfig, since?: string, afterId?: string) => Promise<PullerResult>
+
+// isUpdate: if true, pipeline deletes the existing vector entry before re-indexing
+// instead of skipping duplicates. Used for sources where records mutate after creation.
+export const ALL_PULLERS: Array<{ source: string; pull: PullFn; isUpdate?: boolean }> = [
+  { source: 'synthesis_summary', pull: pullSynthesisSummaries },
+  { source: 'relational_delta', pull: pullRelationalDeltas },
+  { source: 'feeling', pull: pullFeelings },
+  { source: 'companion_journal', pull: pullCompanionJournal },
+  { source: 'wm_continuity_notes', pull: pullContinuityNotes },
+  { source: 'inter_companion_note', pull: pullInterCompanionNotes },
+  { source: 'handoff', pull: pullHandoffs },
+  { source: 'wound', pull: pullWounds },
+  { source: 'companion_dream', pull: pullCompanionDreams },
+  { source: 'open_loop', pull: pullOpenLoops },
+  { source: 'open_loop_closure', pull: pullClosedOpenLoops, isUpdate: true },
+  { source: 'relational_state', pull: pullRelationalState },
+  { source: 'tension', pull: pullTensions },
+  { source: 'tension_update', pull: pullTensionUpdates, isUpdate: true },
+  { source: 'growth_journal', pull: pullGrowthJournal },
+  { source: 'companion_conclusion', pull: pullCompanionConclusions },
+  { source: 'somatic_snapshot', pull: pullSomaticSnapshots },
+  { source: 'drift_log', pull: pullDriftLog },
+  { source: 'live_thread', pull: pullLiveThreads },
+  { source: 'basin_history', pull: pullBasinHistory },
+  { source: 'ledger', pull: pullLedger },
+]
+
+// Exported so tests can verify URL construction directly.
+export function buildUrl(base: string, path: string, since?: string, limit = 100, extra: Record<string, string> = {}): string {
+  const url = new URL(path, base)
+  if (since) url.searchParams.set('since', since)
+  url.searchParams.set('limit', String(limit))
+  for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, v)
+  return url.toString()
+}
+
+export function authHeaders(secret: string): HeadersInit {
+  return { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' }
+}
+
+// Halseth returns either a plain array or { items: [] }.
+// Normalize both shapes to an array.
+async function fetchRecords(url: string, secret: string): Promise<unknown[]> {
+  const res = await fetch(url, {
+    headers: authHeaders(secret),
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) {
+    throw new Error(`Halseth fetch failed: ${res.status} ${res.statusText} ${url}`)
+  }
+  const data = await res.json() as unknown
+  if (Array.isArray(data)) return data
+  if (
+    data !== null &&
+    typeof data === 'object' &&
+    'items' in data &&
+    Array.isArray((data as Record<string, unknown>).items)
+  ) {
+    return (data as Record<string, unknown>).items as unknown[]
+  }
+  return []
+}
+
+// ---- per-source pull functions ----
+
+interface RawSynthesisSummary {
+  id: number
+  companion_id: string
+  summary_type: string
+  subject?: string
+  narrative?: string
+  emotional_register?: string
+  open_threads?: string
+  drevan_state?: string
+  thread_key?: string
+  created_at: string
+}
+
+export async function pullSynthesisSummaries(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/synthesis-summaries', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawSynthesisSummary[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'synthesis_summary',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+      thread_key: rec.thread_key,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawRelationalDelta {
+  id: number
+  created_at: string
+  agent: string
+  delta_text: string
+  valence?: string
+  initiated_by?: string
+}
+
+export async function pullRelationalDeltas(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/deltas', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawRelationalDelta[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'relational_delta',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.agent,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawFeeling {
+  id: number
+  created_at: string
+  companion_id: string
+  [key: string]: unknown
+}
+
+export async function pullFeelings(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/feelings', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawFeeling[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'feeling',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawContinuityNote {
+  note_id: string
+  agent_id: string
+  note_type: string
+  content: string
+  salience?: string
+  source?: string
+  created_at: string
+  /** When the note became memory (its keep, or its birth if born kept), normalised ISO. */
+  cursor_at?: string
+  [key: string]: unknown
+}
+
+// Continuity notes (2026-10-13). A companion's continuity notes followed it across substrates (its own
+// boot reads them) and stopped there: Drevan captured Abby's death in a Claude.ai thread, his Discord
+// boot knew it, Cypher's search found nothing, and Principal had to retell it. Halseth serves only kept,
+// live notes of an allowlisted type (never a draft, never thread_key); /ingest/continuity-ineligible
+// is the paired purge (recall-reconcile.ts). The feed is STRICTLY after `since`, ordered
+// (cursor_at, note_id), with the ledger's after_id tiebreak so a page edge on a tie loses nothing.
+export async function pullContinuityNotes(
+  config: IngestionConfig,
+  since?: string,
+  afterId?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/continuity-notes', since, 100, since && afterId ? { after_id: afterId } : {})
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = []
+    for (const rec of raw as RawContinuityNote[]) {
+      if (!rec || typeof rec.note_id !== 'string' || !rec.note_id || typeof rec.content !== 'string') continue
+      // cursor_at is transport, not content: keep it out of the vault document.
+      const { cursor_at, ...row } = rec
+      records.push({
+        id: rec.note_id as unknown as number,
+        source_type: 'wm_continuity_notes',
+        content: JSON.stringify(row),
+        created_at: rec.created_at,
+        ...(typeof cursor_at === 'string' && cursor_at ? { cursor: cursor_at } : {}),
+        cursor_id: rec.note_id,
+        companion_id: rec.agent_id,
+      })
+    }
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawCompanionJournal {
+  id: number
+  created_at: string
+  agent: string
+  note_text: string
+  /** halseth >= tray pass 2 with cursor=reviewed: when the row became memory (normalised ISO). */
+  cursor_at?: string
+  [key: string]: unknown
+}
+
+export async function pullCompanionJournal(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    // cursor=reviewed (halseth tray pass 2, 2026-09-26): order/filter on when a row became MEMORY, so
+    // a draft kept after the mark is still pulled. An older halseth ignores the param and returns no
+    // cursor_at; the record then falls back to created_at and nothing changes.
+    const url = buildUrl(config.halsethUrl, '/companion-journal', since, 100, { cursor: 'reviewed' })
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawCompanionJournal[]).map((rec) => {
+      // cursor_at is transport, not content: keep it out of the vault document.
+      const { cursor_at, ...row } = rec
+      return {
+        id: rec.id,
+        source_type: 'companion_journal',
+        content: JSON.stringify(row),
+        created_at: rec.created_at,
+        ...(typeof cursor_at === 'string' && cursor_at ? { cursor: cursor_at } : {}),
+        companion_id: rec.agent,
+      }
+    })
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawInterCompanionNote {
+  id: number
+  from_id: string
+  to_id: string | null
+  content: string
+  read_at: string | null
+  created_at: string
+}
+
+export async function pullInterCompanionNotes(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/inter-companion-notes', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawInterCompanionNote[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'inter_companion_note',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.from_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawHandoff {
+  id: number
+  agent_id: string
+  thread_id: string | null
+  title: string
+  summary: string
+  next_steps: string | null
+  open_loops: string | null
+  state_hint: string | null
+  created_at: string
+}
+
+export async function pullHandoffs(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/mind-handoffs', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawHandoff[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'handoff',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.agent_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// ── Growth layer (migration 0045) ────────────────────────────────────────────
+
+interface RawGrowthJournal {
+  id: string
+  companion_id: string
+  entry_type: string
+  content: string
+  source: string
+  tags_json: string
+  created_at: string
+}
+
+export async function pullGrowthJournal(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/growth-journal', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawGrowthJournal[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'growth_journal',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawCompanionConclusion {
+  id: string
+  companion_id: string
+  conclusion_text: string
+  source_sessions: string | null
+  superseded_by: string | null
+  created_at: string
+}
+
+export async function pullCompanionConclusions(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/companion-conclusions', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawCompanionConclusion[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'companion_conclusion',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// ── New surfaces (migrations 0028–0030) ──────────────────────────────────────
+
+interface RawWound {
+  id: string
+  name: string
+  description: string
+  last_visited: string | null
+  last_surfaced_by: string | null
+  created_at: string
+}
+
+export async function pullWounds(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/wounds', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawWound[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'wound',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      // wounds are cross-companion (no companion_id)
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawCompanionDream {
+  id: string
+  companion_id: string
+  dream_text: string
+  source: string
+  examined: number
+  examined_at: string | null
+  created_at: string
+}
+
+export async function pullCompanionDreams(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/companion-dreams', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawCompanionDream[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'companion_dream',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawOpenLoop {
+  id: string
+  companion_id: string
+  loop_text: string
+  weight: number
+  opened_at: string
+  closed_at: string | null
+}
+
+export async function pullOpenLoops(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/open-loops', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawOpenLoop[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'open_loop',
+      content: JSON.stringify(rec),
+      created_at: rec.opened_at,   // opened_at is the canonical timestamp
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// Sweeps for loop closures using closed_at as the HWM.
+// Returns source_type 'open_loop' so the pipeline overwrites the stale vector entry.
+export async function pullClosedOpenLoops(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = new URL('/ingest/open-loops', config.halsethUrl)
+    // Always send closed_since (epoch on first run) to force closed_at ASC ordering
+    // and server-side null filter, so the HWM advances correctly from the start.
+    url.searchParams.set('closed_since', since ?? '1970-01-01T00:00:00.000Z')
+    url.searchParams.set('limit', '100')
+    const raw = await fetchRecords(url.toString(), config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawOpenLoop[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'open_loop',
+      content: JSON.stringify(rec),
+      created_at: rec.closed_at!,  // HWM tracks closed_at for this sweep
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawRelationalState {
+  id: string
+  companion_id: string
+  toward: string
+  state_text: string
+  weight: number
+  state_type: string
+  noted_at: string
+}
+
+export async function pullRelationalState(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/relational-state', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawRelationalState[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'relational_state',
+      content: JSON.stringify(rec),
+      created_at: rec.noted_at,    // noted_at is the canonical timestamp
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawTension {
+  id: string
+  companion_id: string
+  tension_text: string
+  status: string
+  first_noted_at: string
+  last_surfaced_at: string | null
+  notes: string | null
+}
+
+export async function pullTensions(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/tensions', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawTension[]).map((rec) => ({
+      id: rec.id as unknown as number,
+      source_type: 'tension',
+      content: JSON.stringify(rec),
+      created_at: rec.first_noted_at,  // first_noted_at is the canonical timestamp
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// Sweeps for status changes on existing tensions using last_surfaced_at as the HWM.
+// Returns the same source_type ('tension') so the pipeline overwrites the stale vector entry.
+export async function pullTensionUpdates(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = new URL('/ingest/tensions', config.halsethUrl)
+    // Always send updated_since (epoch on first run) to force last_surfaced_at ASC ordering
+    // and server-side null filter, so the HWM advances correctly from the start.
+    url.searchParams.set('updated_since', since ?? '1970-01-01T00:00:00.000Z')
+    url.searchParams.set('limit', '100')
+    const raw = await fetchRecords(url.toString(), config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawTension[]).map((rec) => ({
+        id: rec.id as unknown as number,
+        source_type: 'tension',
+        content: JSON.stringify(rec),
+        created_at: rec.last_surfaced_at!,  // HWM tracks last_surfaced_at for this sweep
+        companion_id: rec.companion_id,
+      }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// ── Self-monitoring surfaces (migrations 0020/0022/0028) ─────────────────────
+// somatic_snapshot + drift_log support a server-side `since` filter (clean HWM).
+// live_threads + basin_history do NOT -- they pull the full recent set each cycle;
+// pipeline dedup (existsByPath on rag/<source>/<id>) skips already-indexed rows, so
+// re-pulling is harmless. Left as non-update: the semantic content (snapshot text,
+// thread name/flavor, drift notes) is fixed at insert; mutating flags (charge,
+// caleth_confirmed, dismissed_at) don't warrant a re-embed every 20 minutes.
+
+interface RawSomaticSnapshot {
+  id: number
+  companion_id: string
+  snapshot: string
+  model_used: string | null
+  stale_after: string | null
+  created_at: string
+}
+
+export async function pullSomaticSnapshots(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/somatic-snapshots', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawSomaticSnapshot[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'somatic_snapshot',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawDriftLog {
+  id: number
+  companion_id: string
+  signal_type: string
+  context: string | null
+  detected_at: string
+}
+
+export async function pullDriftLog(
+  config: IngestionConfig,
+  since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = buildUrl(config.halsethUrl, '/ingest/drift-log', since)
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawDriftLog[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'drift_log',
+      content: JSON.stringify(rec),
+      created_at: rec.detected_at,  // detected_at is the canonical timestamp
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawLiveThread {
+  id: number
+  companion_id: string
+  name: string
+  flavor: string | null
+  charge: number
+  status: string
+  active_since_count: number | null
+  notes: string | null
+  created_at: string
+  closed_at: string | null
+}
+
+// /ingest/live-threads has no `since` param -- request status=all and rely on
+// pipeline dedup. The HWM the pipeline advances is ignored by this puller.
+export async function pullLiveThreads(
+  config: IngestionConfig,
+  _since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = new URL('/ingest/live-threads', config.halsethUrl)
+    url.searchParams.set('status', 'all')
+    url.searchParams.set('limit', '100')
+    const raw = await fetchRecords(url.toString(), config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawLiveThread[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'live_thread',
+      content: JSON.stringify(rec),
+      created_at: rec.created_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+interface RawBasinHistory {
+  id: number
+  companion_id: string
+  drift_score: number | null
+  drift_type: string | null
+  caleth_confirmed: number | null
+  dismissed_at: string | null
+  worst_basin: string | null
+  notes: string | null
+  recorded_at: string
+}
+
+// /ingest/basin-history has no `since` param -- pull the recent set and rely on
+// pipeline dedup. recorded_at is the canonical timestamp.
+export async function pullBasinHistory(
+  config: IngestionConfig,
+  _since?: string,
+): Promise<PullerResult> {
+  try {
+    const url = new URL('/ingest/basin-history', config.halsethUrl)
+    url.searchParams.set('limit', '100')
+    const raw = await fetchRecords(url.toString(), config.halsethSecret)
+    const records: IngestRecord[] = (raw as RawBasinHistory[]).map((rec) => ({
+      id: rec.id,
+      source_type: 'basin_history',
+      content: JSON.stringify(rec),
+      created_at: rec.recorded_at,
+      companion_id: rec.companion_id,
+    }))
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}
+
+// ── Ledger lane (halseth mig 0134, imp-lane tranche 1, 2026-09-26) ───────────
+// Clerk records ABOUT a companion, never his words. Each row's `content` is the full rendered line,
+// mark first (`〔ledger · <function> · <date>〕 <body> Source: <kind> <ref>.`), stamped by Halseth.
+// Drevan's rule: the index must honour the lane -- the mark survives indexing and a drop purges the
+// chunk. So this puller carries `content` VERBATIM (not JSON.stringify(row) like every other source),
+// and the pipeline indexes it as-is: no wrapChunk preamble (which re-voices by construction: "who
+// wrote this and their emotional register"), no splitting, one chunk per entry at rag/ledger/<id>.
+// Never routed through the vault-materializer (slugify drops the mark; firstSentence makes it the H1).
+// The feed serves open + kept rows and pages on the later of created_at / state_at, so a keep re-serves
+// a row: its content is unchanged, and pipeline dedup (existsByPath) skips it. Drops are purged by the
+// ledger reconcile (recall-reconcile.ts, /ingest/ledger-ineligible).
+
+export const LEDGER_MARK_PREFIX = '〔ledger · '
+
+interface RawLedgerEntry {
+  id: string
+  companion_id: string
+  function: string
+  content: string
+  source_kind: string
+  source_ref: string
+  observed_on: string
+  state: string
+  created_at: string
+  state_at: string | null
+  cursor_at?: string
+}
+
+/** The later of two stamps (created_at vs state_at); unparseable falls back to a string compare. */
+function laterStamp(a: string | null | undefined, b: string | null | undefined): string | undefined {
+  if (!a) return b ?? undefined
+  if (!b) return a
+  const x = Date.parse(a)
+  const y = Date.parse(b)
+  if (Number.isFinite(x) && Number.isFinite(y)) return y > x ? b : a
+  return b > a ? b : a
+}
+
+export async function pullLedger(
+  config: IngestionConfig,
+  since?: string,
+  afterId?: string,
+): Promise<PullerResult> {
+  try {
+    // The feed is STRICTLY after `since` and ordered (cursor_at, id). after_id (the last id indexed at
+    // that cursor, persisted by the pipeline next to the mark) re-includes the rows that tie the cursor
+    // past that id, so a page of 100 ending mid-tie loses nothing. Only sent with a since.
+    const url = buildUrl(config.halsethUrl, '/ingest/ledger', since, 100, since && afterId ? { after_id: afterId } : {})
+    const raw = await fetchRecords(url, config.halsethSecret)
+    const records: IngestRecord[] = []
+    for (const rec of raw as RawLedgerEntry[]) {
+      const cursor = rec && ((typeof rec.cursor_at === 'string' && rec.cursor_at) ? rec.cursor_at : laterStamp(rec.created_at, rec.state_at))
+      if (!rec || typeof rec.content !== 'string' || !rec.content.startsWith(LEDGER_MARK_PREFIX)) {
+        // A ledger line without its mark would launder as un-marked text. Refuse to index it -- but hand it
+        // to the pipeline as a SKIP record so the mark (and after_id) still move past it (2026-09-26 review
+        // S2): dropping it here left the mark behind it, so it was re-fetched and re-logged every cycle, and
+        // a page of 100 refused rows stalled the feed forever. Logged here, once per row: once the mark
+        // moves, the row is never fetched again.
+        console.error(`[ingestion] ledger ${rec?.id ?? '(no id)'}: content does not start with the ledger mark -- NOT indexed (mark advances past it)`)
+        if (rec && typeof rec.id === 'string' && rec.id && cursor) {
+          records.push({
+            id: rec.id as unknown as number,
+            source_type: 'ledger',
+            content: '',
+            created_at: rec.created_at,
+            cursor,
+            cursor_id: rec.id,
+            skip: 'unmarked',
+          })
+        }
+        continue
+      }
+      records.push({
+        id: rec.id as unknown as number,
+        source_type: 'ledger',
+        content: rec.content,
+        created_at: rec.created_at,
+        ...(cursor ? { cursor } : {}),
+        cursor_id: rec.id,
+        companion_id: rec.companion_id,
+      })
+    }
+    return { records }
+  } catch (e) {
+    return { records: [], error: (e as Error).message }
+  }
+}

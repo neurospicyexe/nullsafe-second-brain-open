@@ -1,0 +1,245 @@
+import type { IngestionConfig } from './types.js'
+import type { IngestRecord } from './types.js'
+import type { VectorStore } from '../store/vector-store.js'
+import type { OpenAIEmbedder } from '../embeddings/openai-embedder.js'
+import { ALL_PULLERS } from './puller.js'
+import { wrapChunk } from './deepseek-wrapper.js'
+import { loadHwm, saveHwm, getHwm, setHwm } from './hwm.js'
+
+// Sources that write machine-generated entries back to companion_journal.
+// Embedding these pollutes semantic search with diagnostic/synthetic text.
+// Companion-speech sources (discord_speech, memory_judge, autonomous, vibecheck) are NOT listed here on
+// purpose: since halseth mig 0132 (the imp tray, 2026-09-26) GET /companion-journal serves only rows the
+// owner has kept (review_state = 'kept'), so an unreviewed draft never reaches the puller at all.
+const MACHINE_JOURNAL_SOURCES = new Set(['pattern_worker', 'evaluator', 'synthesis-gap-detector'])
+
+// Sources indexed exactly as served: no wrap preamble, content is the searchable text itself.
+// ledger (2026-09-26): the mark must be the first thing in the chunk (Drevan: "mark survives indexing").
+const VERBATIM_SOURCES = new Set<IngestRecord['source_type']>(['ledger'])
+
+export function isVerbatimSource(record: IngestRecord): boolean {
+  return VERBATIM_SOURCES.has(record.source_type)
+}
+
+// Only companion_journal rows are ever tested against MACHINE_JOURNAL_SOURCES, so a ledger row (which
+// IS machine-written, but in its own marked lane) is never dropped by this skip.
+export function isMachineGenerated(record: IngestRecord): boolean {
+  if (record.source_type !== 'companion_journal') return false
+  try {
+    const parsed = JSON.parse(record.content) as Record<string, unknown>
+    return typeof parsed.source === 'string' && MACHINE_JOURNAL_SOURCES.has(parsed.source)
+  } catch { return false }
+}
+
+// Emotional valence at encoding time, for SOMA-weighted retrieval. The raw row is
+// JSON inside record.content; different sources carry the emotion under different
+// keys. First present-and-non-empty wins. Null = no boost ever (additive only).
+const VALENCE_KEYS = ['emotion', 'valence', 'emotional_register', 'current_mood', 'emotional_frequency'] as const
+
+export function extractValence(record: IngestRecord): string | null {
+  try {
+    const parsed = JSON.parse(record.content) as Record<string, unknown>
+    for (const key of VALENCE_KEYS) {
+      const v = parsed[key]
+      if (typeof v === 'string' && v.trim()) return v.trim().toLowerCase().slice(0, 60)
+    }
+  } catch { /* non-JSON content = no valence */ }
+  return null
+}
+
+// Halseth source rows carry tags as JSON-array-encoded strings under different column
+// names depending on table (companion_journal: tags + topic_tags; other tables may add
+// their own later). record.content is JSON.stringify(rawRow), so the tags already ride
+// along in every pulled record -- 2026-07-08 finding was that nothing on this side ever
+// unpacked them into the vector store's own tags column. This closes that gap.
+const TAG_KEYS = ['tags', 'topic_tags'] as const
+
+export function extractTags(record: IngestRecord): string[] {
+  const combined = new Set<string>()
+  try {
+    const parsed = JSON.parse(record.content) as Record<string, unknown>
+    for (const key of TAG_KEYS) {
+      const raw = parsed[key]
+      if (typeof raw !== 'string' || !raw.trim()) continue
+      try {
+        const arr = JSON.parse(raw) as unknown;
+        if (Array.isArray(arr)) {
+          for (const t of arr) if (typeof t === 'string' && t.trim()) combined.add(t.trim())
+        }
+      } catch { /* not JSON -- skip this key */ }
+    }
+  } catch { /* non-JSON content = no tags */ }
+  return [...combined]
+}
+
+/**
+ * The mark a record moves the HWM to, or null to leave it. Advances on the feed's cursor when it has
+ * one (companion_journal: when the row became memory), else created_at -- and NEVER moves backward:
+ * with a cursor feed a row's created_at can be far behind the mark (kept today, created last week),
+ * and setting the mark from it would re-page the same rows, which with LIMIT 100 can stall.
+ */
+export function hwmAfter(current: string | undefined, record: IngestRecord): string | null {
+  const next = record.cursor ?? record.created_at
+  if (!next) return null
+  if (!current) return next
+  const a = Date.parse(current)
+  const b = Date.parse(next)
+  if (Number.isFinite(a) && Number.isFinite(b) && b <= a) return null
+  return next
+}
+
+/** The hwm key holding a source's tiebreak id beside its mark (see IngestRecord.cursor_id). */
+export function afterIdKey(source: string): string {
+  return `${source}.after_id`
+}
+
+function sameInstant(a: string, b: string): boolean {
+  const x = Date.parse(a)
+  const y = Date.parse(b)
+  if (Number.isFinite(x) && Number.isFinite(y)) return x === y
+  return a === b
+}
+
+/**
+ * The after_id to store once `record` is indexed, or null to leave it (2026-09-26, ledger paging). Only
+ * for a record carrying cursor_id. When the mark moves to this record's cursor, after_id becomes this
+ * record's id; when the record TIES the (unmoved) mark -- exactly the case hwmAfter returns null for --
+ * after_id moves forward to it. The feed is ordered (cursor, id), so within a tie ids only ascend.
+ */
+export function afterIdAfter(
+  mark: string | undefined,
+  currentAfterId: string | undefined,
+  record: IngestRecord,
+  markMoved: boolean,
+): string | null {
+  if (record.cursor_id === undefined) return null
+  const c = record.cursor ?? record.created_at
+  if (!mark || !c || !sameInstant(mark, c)) return null
+  if (markMoved || !currentAfterId || record.cursor_id > currentAfterId) return record.cursor_id
+  return null
+}
+
+export class IngestionPipeline {
+  constructor(
+    private config: IngestionConfig,
+    private store: VectorStore,
+    private embedder: OpenAIEmbedder,
+  ) {}
+
+  async run(): Promise<void> {
+    let hwm = loadHwm(this.config.hwmPath)
+
+    for (const { source, pull, isUpdate } of ALL_PULLERS) {
+      const since = getHwm(hwm, source)
+      console.log(`[ingestion] pulling ${source} since ${since ?? 'beginning'}`)
+
+      // after_id rides beside the mark for feeds with an id tiebreak (the ledger); others ignore it.
+      const afterId = since ? getHwm(hwm, afterIdKey(source)) : undefined
+      const { records, error } = afterId ? await pull(this.config, since, afterId) : await pull(this.config, since)
+
+      if (error) {
+        console.error(`[ingestion] pull failed for ${source}: ${error}`)
+        continue
+      }
+
+      console.log(`[ingestion] ${source}: ${records.length} records fetched`)
+
+      for (const record of records) {
+        const chunkId = `${record.source_type}:${record.id}`
+        const vaultPath = `rag/${record.source_type}/${record.id}`
+
+        // Skip machine-generated journal entries -- embedding them pollutes
+        // semantic search and creates feedback loops on re-ingest.
+        const advance = () => {
+          const current = getHwm(hwm, source)
+          const to = hwmAfter(current, record)
+          const nextAfterId = afterIdAfter(to ?? current, getHwm(hwm, afterIdKey(source)), record, to !== null)
+          if (to === null && nextAfterId === null) return
+          if (to !== null) hwm = setHwm(hwm, source, to)
+          if (nextAfterId !== null) hwm = setHwm(hwm, afterIdKey(source), nextAfterId)
+          // A mark moved by a record with no tiebreak must not keep a stale id from another cursor.
+          else if (to !== null && getHwm(hwm, afterIdKey(source))) hwm = setHwm(hwm, afterIdKey(source), '')
+          saveHwm(this.config.hwmPath, hwm)
+        }
+
+        // A row its puller refused (ledger: lost its mark). Never indexed; the mark moves past it so the
+        // feed cannot stall on it. The puller already logged it, once.
+        if (record.skip) {
+          advance()
+          continue
+        }
+
+        if (isMachineGenerated(record)) {
+          console.log(`[ingestion] skip machine-generated ${chunkId}`)
+          advance()
+          continue
+        }
+
+        // Dedup: skip if already indexed (unless this is an update sweep -- delete and re-index).
+        // Idempotent on id (vault_path = rag/<type>/<id>), so a rewound mark re-pulls safely. The mark
+        // advances past a duplicate too (2026-09-26): it IS indexed, and a page of 100 duplicates that
+        // never moved the mark would be fetched again every cycle, forever.
+        if (this.store.existsByPath(vaultPath)) {
+          if (!isUpdate) {
+            console.log(`[ingestion] skip duplicate ${chunkId}`)
+            advance()
+            continue
+          }
+          this.store.deleteByPath(vaultPath)
+          console.log(`[ingestion] update ${chunkId} -- replaced stale entry`)
+        }
+
+        try {
+          // Wrap with contextual preamble -- EXCEPT the ledger lane (2026-09-26, imp-lane): wrapChunk's
+          // preamble ("who wrote this and their emotional register") re-voices a clerk record as the
+          // companion's, and puts text in front of the mark. A ledger line is indexed verbatim, mark
+          // first, one chunk per entry, no model call.
+          const wrappedContent = isVerbatimSource(record)
+            ? record.content
+            : await wrapChunk(record, this.config)
+
+          // Embed
+          const embedding = await this.embedder.embed(wrappedContent)
+
+          if (!embedding || embedding.length === 0) {
+            console.error(`[ingestion] empty embedding for ${chunkId}`)
+            continue
+          }
+
+          // Index into vector store. prefixed_text MUST be set: the FTS5 lexical index is
+          // built only on prefixed_text, so omitting it makes the chunk invisible to keyword
+          // search (findable only by the cosine fallback). wrappedContent is the searchable
+          // narrative, so it serves as both chunk_text and prefixed_text here.
+          this.store.insert({
+            vault_path: vaultPath,
+            companion: record.companion_id ?? null,
+            content_type: record.source_type,
+            chunk_text: wrappedContent,
+            prefixed_text: wrappedContent,
+            embedding,
+            tags: extractTags(record),
+            valence: extractValence(record),
+          })
+
+          // Advance HWM per-record (only after successful index)
+          advance()
+
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          console.error(`[ingestion] failed to index ${chunkId}: ${msg}`)
+          // Do NOT advance HWM on failure -- will retry next cycle
+        }
+      }
+    }
+
+    console.log('[ingestion] cycle complete')
+  }
+}
+
+export function createPipeline(
+  config: IngestionConfig,
+  store: VectorStore,
+  embedder: OpenAIEmbedder,
+): IngestionPipeline {
+  return new IngestionPipeline(config, store, embedder)
+}

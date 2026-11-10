@@ -1,0 +1,664 @@
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+import cors from "cors";
+import { createServer as createHttpServer } from "http";
+import { randomUUID } from "crypto";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { loadConfig } from "./config.js";
+import { loadIngestionConfig } from "./ingestion/config.js";
+import { cronHealth } from "./ingestion/cron-health.js";
+import { getEmbedderHealth } from "./embeddings/openai-embedder.js";
+import { buildHealthPayload } from "./health-payload.js";
+import { createServer } from "./server.js";
+import { setupTriggers } from "./triggers.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { createAuthorizeGate } from "./oauth-consent.js";
+import { semanticChunk } from "./ingestion/chunker.js";
+import { wrapChunk } from "./ingestion/deepseek-wrapper.js";
+import { withConcurrencyLimit } from "./ingestion/corpus.js";
+import type { SourceType, IngestRecord } from "./ingestion/types.js";
+import { IngestionPipeline } from "./ingestion/pipeline.js";
+import { evaluateSurprisal } from "./ingestion/surprisal-gate.js";
+import { checkApiKey } from "./http-auth.js";
+import { parseRetractBody, retractPath } from "./retract.js";
+import { contextPrefix } from "./indexer.js";
+
+// ── Startup ──────────────────────────────────────────────────────────────────
+
+let config;
+try {
+  config = loadConfig();
+} catch (err) {
+  console.error("[startup] Failed to load config:", err);
+  process.exit(1);
+}
+
+let ingestionConfig: ReturnType<typeof loadIngestionConfig> | undefined;
+try {
+  ingestionConfig = loadIngestionConfig();
+} catch (err) {
+  console.error("[startup] Ingestion config unavailable (corpus ingest endpoint disabled):", err);
+}
+
+if (!config.http) {
+  console.error('[startup] HTTP transport requires an "http" block in second-brain.config.json (port + api_key).');
+  process.exit(1);
+}
+
+let makeMcpServer: ReturnType<typeof createServer>["makeMcpServer"];
+let synthesis: ReturnType<typeof createServer>["synthesis"];
+let store: ReturnType<typeof createServer>["store"];
+let embedder: ReturnType<typeof createServer>["embedder"];
+let indexer: ReturnType<typeof createServer>["indexer"];
+let adapter: ReturnType<typeof createServer>["adapter"];
+try {
+  ({ makeMcpServer, synthesis, store, embedder, indexer, adapter } = createServer(config));
+} catch (err) {
+  console.error("[startup] Failed to create server:", err);
+  process.exit(1);
+}
+
+try {
+  await setupTriggers(config, synthesis, store, embedder);
+} catch (err) {
+  console.error("[startup] Failed to set up triggers (non-fatal):", err);
+}
+
+const { port, api_key } = config.http;
+
+// Public base URL drives the OAuth issuer / resource-server / metadata URLs and CORS.
+// Set http.public_url in config for production; fall back to localhost for dev.
+let publicUrl = config.http.public_url;
+if (!publicUrl) {
+  publicUrl = `http://localhost:${port}`;
+  console.warn(
+    `[startup] http.public_url is not set — OAuth/CORS defaulting to ${publicUrl}. ` +
+    `Set http.public_url to your public HTTPS URL for production deployments.`,
+  );
+}
+const publicUrlBase = publicUrl.replace(/\/+$/, "");
+
+// Log what we initialized — no secrets, just shape
+console.log("[startup] Configuration loaded:");
+console.log(`  adapter  : ${config.vault.adapter}`);
+console.log(`  companions: ${config.companions.map(c => c.id).join(", ")}`);
+console.log(`  embeddings: ${config.embeddings.provider} / ${config.embeddings.model} / key=${config.embeddings.api_key ? "set" : "MISSING"}`);
+console.log(`  halseth  : ${config.halseth.url} / secret=${config.halseth.secret ? "set" : "MISSING"}`);
+console.log(`  port     : ${port}`);
+
+const issuerUrl = new URL(publicUrlBase);
+const resourceServerUrl = new URL(`${publicUrlBase}/mcp`);
+const resourceMetadataUrl = `${publicUrlBase}/.well-known/oauth-protected-resource/mcp`;
+
+const oauthProvider = new SingleUserOAuthProvider(api_key);
+
+// ── Express app ───────────────────────────────────────────────────────────────
+
+const app = express();
+app.set("trust proxy", 1);
+
+// CORS must be first — handles OPTIONS preflight before auth runs
+app.use(cors({
+  origin: ["https://claude.ai", publicUrlBase],
+  credentials: true,
+}));
+
+// Security headers — defense-in-depth even behind Caddy proxy
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+
+// Raise body limit to 4 MB — MCP tool payloads with large content exceed the
+// default 100 kb limit, causing raw-body to throw before the handler runs.
+app.use(express.json({ limit: "4mb" }));
+
+// Body-parse error handler — must be 4-param for Express to treat it as an
+// error handler (not a regular route). Catches entity.too.large and bad JSON
+// before they bubble up as unhandled exceptions.
+app.use((err: Error & { type?: string; status?: number }, _req: Request, res: Response, next: NextFunction) => {
+  if ((err as { type?: string }).type === "entity.too.large") {
+    console.error("[http] Payload too large — increase body limit in index-http.ts");
+    res.status(413).json({
+      jsonrpc: "2.0",
+      error: { code: -32700, message: "Payload too large" },
+      id: null,
+    });
+    return;
+  }
+  if (err instanceof SyntaxError && (err as { status?: number }).status === 400) {
+    console.error("[http] Malformed JSON body:", err.message);
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32700, message: "Parse error: invalid JSON" },
+      id: null,
+    });
+    return;
+  }
+  next(err);
+});
+
+// OAuth discovery + token endpoints — must be at app root before any guards
+// Consent step: passphrase form + per-IP lockout, BEFORE the SDK router (which never forwards a key).
+app.use("/authorize", express.urlencoded({ extended: false, limit: "16kb" }), createAuthorizeGate({ passphrase: api_key }));
+app.use(mcpAuthRouter({ provider: oauthProvider, issuerUrl, resourceServerUrl }));
+
+// Health check — unauthenticated, used for uptime monitoring.
+// Includes cron job status; returns 503 if any job is in error or stale.
+app.get("/health", (_req, res) => {
+  cronHealth.checkStale();
+  // Body shape + status rule live in health-payload.ts (pure, tested). This handler only gathers inputs.
+  const body = buildHealthPayload({
+    crons: cronHealth.getAll(),
+    cronsHealthy: cronHealth.isHealthy(),
+    embedder: getEmbedderHealth(),
+    pendingEmbed: store.pendingEmbedCount(),
+    pendingEmbedOldestAgeHours: store.pendingEmbedOldestAgeHours(),
+    pendingIndex: store.pendingIndexCount(),
+    vaultQueuePending: adapter.pendingCount?.() ?? 0,
+  });
+  res.status(body.status === "ok" ? 200 : 503).json(body);
+});
+
+// Bearer auth guard on all /mcp routes
+app.use("/mcp", requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }));
+
+// ── MCP session registry ──────────────────────────────────────────────────────
+//
+// Sessions accumulate in the transport Map until transport.onclose fires, which
+// requires the client to send an explicit DELETE. Most MCP clients just disconnect.
+// Without a sweep, the Map grows unbounded — observed at 1002+ idle sessions in
+// production. Each entry tracks lastActivity; an interval evicts stale entries.
+
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+
+const transports = new Map<string, StreamableHTTPServerTransport>();
+const lastSeen = new Map<string, number>();
+
+setInterval(() => {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [sid, ts] of lastSeen) {
+    if (now - ts > SESSION_IDLE_TIMEOUT_MS) {
+      const transport = transports.get(sid);
+      try { transport?.close?.(); } catch {}
+      transports.delete(sid);
+      lastSeen.delete(sid);
+      evicted++;
+    }
+  }
+  if (evicted > 0) {
+    console.error(`[mcp] swept ${evicted} idle sessions (active: ${transports.size})`);
+  }
+}, SESSION_SWEEP_INTERVAL_MS).unref();
+
+const mcpHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const method = String(req.body?.method ?? req.method).replace(/[\r\n]/g, " ").slice(0, 64);
+    console.error(`[mcp] ${req.method} session=${sessionId?.slice(0, 8) ?? "none"} method=${method}`);
+
+    if (sessionId && transports.has(sessionId)) {
+      lastSeen.set(sessionId, Date.now());
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    if (req.method === "POST" && isInitializeRequest(req.body)) {
+      // Accept both fresh connections (no session ID) and stale session IDs from
+      // clients that cached a session across a server restart. When the client
+      // already has a session ID we reuse it as the generator so the response
+      // echoes the same ID back — the client never notices the restart.
+      const reuseId = sessionId ?? null;
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: reuseId ? () => reuseId : () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          transports.set(sid, transport);
+          lastSeen.set(sid, Date.now());
+          const label = reuseId ? "re-registered" : "initialized";
+          console.error(`[mcp] Session ${label}: ${sid} (active: ${transports.size})`);
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          transports.delete(sid);
+          lastSeen.delete(sid);
+          console.error(`[mcp] Session closed: ${sid} (active: ${transports.size})`);
+        }
+      };
+
+      await makeMcpServer().connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    // Unknown session ID on a non-initialize request — session is gone (restart).
+    // 404 signals to the client that it should re-initialize.
+    console.error(`[mcp] 404 — sessionId=${sessionId ?? "none"} known=${[...transports.keys()].map(k => k.slice(0, 8)).join(",")}`);
+    res.status(404).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Session not found: please re-initialize" },
+      id: null,
+    });
+  } catch (err) {
+    console.error("[mcp] Handler error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+};
+
+app.post("/mcp", mcpHandler);
+app.get("/mcp", mcpHandler);
+app.delete("/mcp", mcpHandler);
+
+// ── Manual ingest endpoint ────────────────────────────────────────────────────
+
+// POST /ingest/discord -- streaming indexer (real-time Discord recall, 2026-06-09).
+// Registered BEFORE the OAuth middleware deliberately: this route is called
+// fire-and-forget from the bots on the same host (server binds 127.0.0.1) and uses
+// the simple SB_INGEST_KEY bearer check instead of the OAuth flow.
+// Vector-store ONLY -- no vault file per message (vault stays curated; the durable
+// record of a conversation still arrives via session synthesis). Rows live under
+// the synthetic path family discord-live/<channel>/<message_id> and age out after
+// 7 days via pruneByPathPrefix, so the store never accumulates unbounded chat.
+// Body: { companion?: string, author: string, content: string, channel_id?: string, message_id: string }
+let lastDiscordPrune = 0;
+// POST /retract -- drop one discord-live document (and its vectors) from the store (2026-09-26).
+// The live-ingest indexes companion replies unconditionally, so a fabricated reply became a
+// top-ranked vault hit within seconds and was served back on the next question. Same auth as
+// ingest; discord-live layer only (see retract.ts); reports whether anything was actually there.
+app.post("/retract", async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!checkApiKey(req.headers.authorization, process.env["SB_INGEST_KEY"] ?? "")) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+    const parsed = parseRetractBody(req.body);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const before = retractPath(store, parsed.path);
+    console.log(`[retract] ${parsed.path}: ${before} row(s) removed`);
+    res.json({ path: parsed.path, removed: before, existed: before > 0 });
+  } catch (e) {
+    res.status(500).json({ error: String(e instanceof Error ? e.message : e).slice(0, 200) });
+  }
+});
+
+app.post("/ingest/discord", async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (!checkApiKey(req.headers.authorization, process.env["SB_INGEST_KEY"] ?? "")) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+    const { companion, author, content, channel_id, message_id } = req.body ?? {};
+    if (typeof content !== "string" || !content.trim() || typeof message_id !== "string" || !message_id.trim()) {
+      res.status(400).json({ error: "content and message_id are required" });
+      return;
+    }
+    const vaultPath = `discord-live/${typeof channel_id === "string" && channel_id ? channel_id : "unknown"}/${message_id}.md`;
+    if (store.existsByPath(vaultPath)) {
+      res.json({ ok: true, deduped: true });
+      return;
+    }
+    const resolvedCompanion = typeof companion === "string" && companion.trim() ? companion.toLowerCase().slice(0, 64) : null;
+    const text = `${typeof author === "string" && author ? author : "unknown"}: ${content.trim()}`.slice(0, 4000);
+    const prefixed = contextPrefix({ path: vaultPath, companion: resolvedCompanion, contentType: "observation", section: "discord-live" }) + text;
+    // A DEAD EMBEDDER MUST NOT EAT THE CONVERSATION (2026-08-10).
+    //
+    // This line used to be unguarded, so any embedder failure threw straight to the 500 below and the message
+    // was gone -- there is no vault file for a Discord message, so nothing could ever recover it. That is how
+    // 2026-07-31..08-10 vanished when the OpenAI balance hit zero. Queue the TEXT and answer 202: the caller
+    // is fire-and-forget and cannot retry, so accepting-and-queueing is the only shape that keeps the write.
+    let embedding: number[] | undefined;
+    try {
+      [embedding] = await embedder.embedBatch([prefixed]);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      store.markPendingEmbed({
+        vaultPath, companion: resolvedCompanion, contentType: "observation", section: "discord-live",
+        text, prefixedText: prefixed, tags: ["discord-live"], reason,
+      });
+      console.warn(`[ingest/discord] embedder down, QUEUED ${vaultPath} (queue depth ${store.pendingEmbedCount()}): ${reason.slice(0, 120)}`);
+      res.status(202).json({ ok: true, queued: true, pending: store.pendingEmbedCount() });
+      return;
+    }
+    // Surprisal write gate (Zikkaron, 2026-06-12). The embedding is computed anyway
+    // (the insert needs it), so the gate costs one brute-force scan over the TTL-bounded
+    // same-channel rows -- no extra embed call. Env knobs:
+    //   SB_SURPRISAL_GATE=false       -- opt out entirely
+    //   SB_SURPRISAL_THRESHOLD=0.90   -- base similarity above which a message is "unsurprising"
+    if (process.env["SB_SURPRISAL_GATE"] !== "false") {
+      const chan = typeof channel_id === "string" && channel_id ? channel_id : "unknown";
+      const maxSim = store.maxSimilarityForPrefix(embedding ?? [], `discord-live/${chan}/`, 2, 200);
+      const { gated, threshold } = evaluateSurprisal(chan, maxSim, {
+        base: Number(process.env["SB_SURPRISAL_THRESHOLD"] ?? 0.90),
+        floor: 0.78,
+        step: 0.03,
+      });
+      if (gated) {
+        console.log(`[ingest/discord] gated (sim ${maxSim.toFixed(3)} >= ${threshold.toFixed(3)}): ${vaultPath}`);
+        res.json({ ok: true, gated: true });
+        return;
+      }
+    }
+    store.insert({
+      vault_path: vaultPath,
+      companion: resolvedCompanion,
+      content_type: "observation",
+      chunk_text: text,
+      prefixed_text: prefixed,
+      section: "discord-live",
+      chunk_index: 0,
+      embedding: embedding ?? [],
+      tags: ["discord-live"],
+    });
+    // TTL sweep at most hourly -- cheap, but no reason to run it per message.
+    if (Date.now() - lastDiscordPrune > 3_600_000) {
+      lastDiscordPrune = Date.now();
+      const pruned = store.pruneByPathPrefix("discord-live/", 7);
+      if (pruned > 0) console.log(`[ingest/discord] pruned ${pruned} expired live rows`);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[ingest/discord] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "internal error" });
+  }
+});
+
+// Same bearer auth as MCP routes
+app.use("/ingest", requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }));
+
+// POST /ingest/text — index raw text into the vector store as course_material.
+// Used by the NotebookLM → Second Brain seeding workflow from Claude Code.
+// Body: { title: string, content: string, companion?: string, tags?: string[], replace?: boolean }
+app.post("/ingest/text", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { title, content, companion, tags, replace } = req.body ?? {};
+
+    if (typeof title !== "string" || !title.trim()) {
+      res.status(400).json({ error: "title is required" });
+      return;
+    }
+    if (typeof content !== "string" || !content.trim()) {
+      res.status(400).json({ error: "content is required" });
+      return;
+    }
+    if (content.length > 500_000) {
+      res.status(413).json({ error: "content exceeds 500KB limit" });
+      return;
+    }
+
+    const slug = title.trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 100);
+    const vaultPath = `notebooklm/${slug}.md`;
+
+    if (!replace && store.existsByPath(vaultPath)) {
+      res.json({ vault_path: vaultPath, chunks_indexed: 0, message: "already indexed — pass replace:true to overwrite" });
+      return;
+    }
+
+    const resolvedCompanion = typeof companion === "string" ? companion.toLowerCase().slice(0, 64) : null;
+    const resolvedTags: string[] = Array.isArray(tags) ? tags.map(String).slice(0, 20) : [];
+
+    await indexer.write({
+      path: vaultPath,
+      content: content.trim(),
+      companion: resolvedCompanion,
+      content_type: "course_material",
+      tags: resolvedTags,
+      overwrite: true,
+    });
+
+    const chunksIndexed = store.filterByPath(vaultPath).length;
+    console.log(`[ingest] indexed ${chunksIndexed} chunks → ${vaultPath}`);
+    res.json({ vault_path: vaultPath, chunks_indexed: chunksIndexed, message: "ok" });
+  } catch (err) {
+    console.error("[ingest] POST /ingest/text error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "internal error" });
+    }
+  }
+});
+
+// POST /ingest/corpus-file — run one or more .md files through the full DeepSeek
+// semantic chunking pipeline and index into the vector store as historical_corpus.
+// Body: { files: Array<{ filename: string, content: string }>, source_type?: SourceType }
+// Single-file shorthand: { filename: string, content: string, source_type?: SourceType }
+app.post("/ingest/corpus-file", async (req: Request, res: Response): Promise<void> => {
+  if (!ingestionConfig) {
+    res.status(503).json({ error: "ingestion config not available — check DEEPINFRA_API_KEY or DEEPSEEK_API_KEY, HALSETH_URL, HALSETH_SECRET env vars" });
+    return;
+  }
+
+  try {
+    const body = req.body ?? {};
+
+    // Normalise single-file and batch-file shapes into one array
+    const rawFiles: Array<{ filename: unknown; content: unknown }> =
+      Array.isArray(body.files) ? body.files : [{ filename: body.filename, content: body.content }];
+
+    if (rawFiles.length === 0) {
+      res.status(400).json({ error: "no files provided" });
+      return;
+    }
+    if (rawFiles.length > 50) {
+      res.status(400).json({ error: "max 50 files per request" });
+      return;
+    }
+
+    const sourceType: SourceType =
+      typeof body.source_type === "string" && body.source_type.length > 0
+        ? (body.source_type as SourceType)
+        : "historical_corpus";
+
+    // Validate all files up-front before doing any work
+    for (const f of rawFiles) {
+      if (typeof f.filename !== "string" || !f.filename.trim()) {
+        res.status(400).json({ error: "each file must have a non-empty filename" });
+        return;
+      }
+      if (typeof f.content !== "string" || !f.content.trim()) {
+        res.status(400).json({ error: `file "${f.filename}" has empty content` });
+        return;
+      }
+      if (f.content.length > 500_000) {
+        res.status(413).json({ error: `file "${f.filename}" exceeds 500KB limit` });
+        return;
+      }
+    }
+
+    // Respond immediately — Cloudflare's 100s proxy timeout kills long DeepSeek calls.
+    // Processing continues in the background; dedup ensures safe re-runs.
+    res.status(202).json({
+      message: "accepted",
+      source_type: sourceType,
+      files: rawFiles.map(f => (f.filename as string).trim()),
+    });
+
+    // S4: Background processing — explicit .catch() so a top-level throw
+    // (outside the per-file try) doesn't escape as unhandledRejection.
+    void (async () => {
+      for (const f of rawFiles) {
+        const filename = (f.filename as string).trim();
+        let chunksIndexed = 0;
+        let chunksSkipped = 0;
+
+        try {
+          // Same pre-chunk skip as processCorpus: the chunk call is paid, so a re-sent file whose
+          // chunk 0 already exists is skipped before the model runs, not after.
+          if (store.existsByPath(`rag/${sourceType}/${filename}/0`)) {
+            console.log(`[ingest/corpus-file] ${filename}: already indexed, skipped before chunking`);
+            continue;
+          }
+          const chunks = await semanticChunk(f.content as string, ingestionConfig!);
+          console.log(`[ingest/corpus-file] ${filename}: ${chunks.length} chunks`);
+
+          await withConcurrencyLimit(
+            chunks.map((chunk, i) => ({ chunk, i })),
+            ingestionConfig!.concurrencyLimit,
+            ingestionConfig!.concurrencyDelayMs,
+            async ({ chunk, i }) => {
+              const vaultPath = `rag/${sourceType}/${filename}/${i}`;
+
+              if (store.existsByPath(vaultPath)) {
+                chunksSkipped++;
+                return;
+              }
+
+              const record: IngestRecord = {
+                id: i,
+                source_type: sourceType,
+                content: chunk.content,
+                created_at: new Date().toISOString(),
+              };
+
+              const wrapped = await wrapChunk(record, ingestionConfig!);
+              const prefixedText = `[File: ${filename}]\n\n${wrapped}`;
+              const embedding = await embedder.embed(prefixedText);
+
+              store.insert({
+                vault_path: vaultPath,
+                chunk_text: prefixedText,
+                prefixed_text: prefixedText,
+                embedding,
+                companion: null,
+                content_type: sourceType,
+                tags: [chunk.label],
+              });
+
+              chunksIndexed++;
+            }
+          );
+        } catch (err) {
+          console.error(`[ingest/corpus-file] failed: ${filename}`, err);
+          continue;
+        }
+
+        console.log(`[ingest/corpus-file] ${filename}: ${chunksIndexed} indexed, ${chunksSkipped} skipped`);
+      }
+      console.log(`[ingest/corpus-file] batch complete for ${rawFiles.length} files`);
+    })().catch(err => {
+      console.error('[ingest/corpus-file] background batch crashed:', err);
+    });
+  } catch (err) {
+    console.error("[ingest/corpus-file] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "internal error" });
+  }
+});
+
+// POST /ingest/session -- triggered by Halseth session-close webhook.
+// Runs the ingestion pipeline immediately instead of waiting up to 20 min for the cron.
+// Body: { companion_id: string, session_id: string }
+let sessionIngestRunning = false;
+app.post("/ingest/session", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { companion_id, session_id } = req.body ?? {};
+
+    if (typeof companion_id !== "string" || !companion_id.trim()) {
+      res.status(400).json({ error: "companion_id is required" });
+      return;
+    }
+    if (typeof session_id !== "string" || !session_id.trim()) {
+      res.status(400).json({ error: "session_id is required" });
+      return;
+    }
+
+    // S5: atomic check-and-set BEFORE responding so the mutex is acquired
+    // synchronously. Prior version did the check inside the async IIFE, leaving
+    // a race window where two concurrent webhooks could both grab "running=false"
+    // before either flipped it to true. Also wraps IIFE with .catch() so a top-level
+    // throw (outside the inner try/finally) can't escape as unhandledRejection
+    // and leaves the mutex permanently set.
+    if (sessionIngestRunning) {
+      console.warn(`[ingest/session] pipeline already running, skipping for companion=${companion_id} session=${session_id}`);
+      res.status(202).json({ message: "already running", companion_id, session_id });
+      return;
+    }
+    sessionIngestRunning = true;
+    res.status(202).json({ message: "accepted", companion_id, session_id });
+
+    void (async () => {
+      console.log(`[ingest/session] webhook: companion=${companion_id} session=${session_id}`);
+      try {
+        if (!ingestionConfig) {
+          console.warn("[ingest/session] ingestion config unavailable -- skipping");
+          return;
+        }
+        const pipeline = new IngestionPipeline(ingestionConfig, store, embedder);
+        await pipeline.run();
+        console.log(`[ingest/session] pipeline complete for companion=${companion_id}`);
+      } catch (err) {
+        console.error("[ingest/session] pipeline error:", err);
+      } finally {
+        sessionIngestRunning = false;
+      }
+    })().catch(err => {
+      sessionIngestRunning = false;
+      console.error("[ingest/session] background crashed:", err);
+    });
+  } catch (err) {
+    console.error("[ingest/session] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "internal error" });
+  }
+});
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
+
+const httpServer = createHttpServer(app);
+
+// Kill idle connections that hold the socket open without sending a complete
+// request — guards against premature-close / half-open TCP from the client.
+httpServer.setTimeout(30_000);
+
+// Log TCP-level errors (e.g. client disconnects mid-request) without crashing.
+httpServer.on("clientError", (err, socket) => {
+  console.error("[http] Client error:", (err as NodeJS.ErrnoException).code ?? err.message);
+  socket.destroy();
+});
+
+httpServer.listen(port, "127.0.0.1", () => {
+  console.log(`[startup] second-brain listening on 127.0.0.1:${port}`);
+});
+
+// ── Process-level safety nets ─────────────────────────────────────────────────
+
+// Graceful shutdown: close the SQLite connection cleanly so in-flight WAL writes
+// are flushed before systemd sends SIGKILL after TimeoutStopSec.
+const shutdown = (signal: string) => {
+  console.log(`[process] ${signal} received — shutting down`);
+  httpServer.close(() => {
+    try { store.close(); } catch {}
+    process.exit(0);
+  });
+  // Force exit if httpServer.close() hangs (e.g., long-lived SSE connections)
+  setTimeout(() => { try { store.close(); } catch {} process.exit(0); }, 10_000).unref();
+};
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
+
+process.on("uncaughtException", (err) => {
+  console.error("[process] Uncaught exception:", err);
+  // Don't exit — systemd will restart if needed; better to stay up for other sessions
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] Unhandled promise rejection:", reason);
+});

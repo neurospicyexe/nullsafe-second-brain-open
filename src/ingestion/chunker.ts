@@ -1,0 +1,113 @@
+import type { IngestionConfig } from './types.js'
+import { chatComplete } from './deepseek-client.js'
+
+export interface SemanticChunk {
+  label: string
+  content: string
+}
+
+const CHUNK_PROMPT_TEMPLATE = `Split this conversation at topic shifts, emotional pivots, or facet changes. Return ONLY a JSON array, no other text.
+
+Each element: { "label": "<brief label>", "content": "<the chunk text>" }
+
+Conversation:
+{CONTENT}
+
+JSON array:`
+
+export async function semanticChunk(
+  content: string,
+  config: Pick<IngestionConfig, 'deepseekApiKey' | 'deepseekModel'>
+): Promise<SemanticChunk[]> {
+  const MAX_CHARS = 80_000
+
+  if (content.length > MAX_CHARS) {
+    const segments = splitIntoSegments(content, MAX_CHARS)
+    const results: SemanticChunk[] = []
+    for (const segment of segments) {
+      const chunks = await chunkSegment(segment, config)
+      results.push(...chunks)
+    }
+    return hardSplit(results)
+  }
+
+  return hardSplit(await chunkSegment(content, config))
+}
+
+const MAX_EMBED_CHARS = 24_000 // ~6000 tokens, safely under OpenAI's 8192 limit
+
+export function hardSplit(chunks: SemanticChunk[]): SemanticChunk[] {
+  const result: SemanticChunk[] = []
+  for (const chunk of chunks) {
+    if (chunk.content.length <= MAX_EMBED_CHARS) {
+      result.push(chunk)
+      continue
+    }
+    const lines = chunk.content.split('\n')
+    let part = ''
+    let partIdx = 0
+    for (const line of lines) {
+      if (part.length + line.length + 1 > MAX_EMBED_CHARS && part.length > 0) {
+        result.push({ label: `${chunk.label}-${partIdx}`, content: part.trim() })
+        partIdx++
+        part = line
+      } else {
+        part = part ? `${part}\n${line}` : line
+      }
+    }
+    if (part.trim()) result.push({ label: `${chunk.label}-${partIdx}`, content: part.trim() })
+  }
+  return result
+}
+
+export function splitIntoSegments(content: string, maxChars: number): string[] {
+  const paragraphs = content.split(/\n\n+/)
+  const segments: string[] = []
+  let current = ''
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > maxChars && current.length > 0) {
+      segments.push(current.trim())
+      current = para
+    } else {
+      current = current ? `${current}\n\n${para}` : para
+    }
+  }
+  if (current.trim()) segments.push(current.trim())
+  return segments
+}
+
+async function chunkSegment(
+  content: string,
+  config: Pick<IngestionConfig, 'deepseekApiKey' | 'deepseekModel'>
+): Promise<SemanticChunk[]> {
+  const prompt = CHUNK_PROMPT_TEMPLATE.replace('{CONTENT}', content)
+
+  // DeepInfra first, direct DeepSeek only as the emergency lane (deepseek-client.ts).
+  const result = await chatComplete({
+    messages: [{ role: 'user', content: prompt }],
+    maxTokens: 8000,
+    temperature: 0.2,
+    caller: 'semanticChunk',
+  }, config)
+
+  if (!result.ok) {
+    throw new Error(`DeepSeek chunking failed: ${result.status ?? 'network'}`)
+  }
+
+  const raw = result.content
+
+  // Extract JSON array -- model may wrap in markdown or add preamble text
+  const start = raw.indexOf('[')
+  const end = raw.lastIndexOf(']')
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      return JSON.parse(raw.slice(start, end + 1)) as SemanticChunk[]
+    } catch {
+      // fall through to single-chunk fallback
+    }
+  }
+
+  // Fallback: treat entire segment as one chunk (handles truncated/unparseable responses)
+  return [{ label: 'full-segment', content }]
+}

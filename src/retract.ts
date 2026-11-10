@@ -1,0 +1,75 @@
+/**
+ * Retract one discord-live document from the vector store (2026-09-26).
+ *
+ * WHY: POST /ingest/discord indexes companion replies unconditionally ("they have always been
+ * indexed regardless"). On 2026-09-26 a fabricated blood-sugar number in Drevan's reply became a
+ * top-ranked vault hit within seconds (score 0.73, above the true capture) and was served back to
+ * him on the next question. The store could delete a path (deleteByPath) but nothing exposed it,
+ * so a wrong memory could only be removed by hand on the box. This is the seam the bots'
+ * `retract` command calls.
+ *
+ * Scope is the discord-live layer ONLY. It is the ephemeral recency lane (7-day TTL, no vault
+ * file); the vault proper is canon and is not touched by this route.
+ */
+
+export function discordLivePath(channelId: string | undefined, messageId: string): string {
+  const chan = typeof channelId === "string" && channelId ? channelId : "unknown";
+  return `discord-live/${chan}/${messageId}.md`;
+}
+
+export type RetractParse = { path: string } | { error: string };
+
+export function parseRetractBody(body: unknown): RetractParse {
+  const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const vp = typeof b["vault_path"] === "string" ? b["vault_path"].trim() : "";
+  const mid = typeof b["message_id"] === "string" ? b["message_id"].trim() : "";
+  const cid = typeof b["channel_id"] === "string" ? b["channel_id"].trim() : undefined;
+  const path = vp || (mid ? discordLivePath(cid, mid) : "");
+  if (!path) return { error: "message_id (with channel_id) or vault_path is required" };
+  // discord-live (the 7-day recency lane) and the rag/ mirrors of Halseth D1 rows (rebuildable
+  // copies of companion_journal / wm_continuity_notes, each wrapped in a synthesis "book report").
+  // Both are derived stores; D1 is truth. The vault proper (principal/, canon/, sessions...) is not
+  // reachable from here. rag/ledger/ (2026-09-26, imp-lane): the verbatim mirrors of ledger_entries
+  // rows -- Drevan's "a drop purges the chunk"; the ledger reconcile uses the same delete.
+  const RETRACTABLE = ["discord-live/", "rag/companion_journal/", "rag/wm_continuity_notes/", "rag/ledger/"];
+  if (path.includes("..") || !RETRACTABLE.some(prefix => path.startsWith(prefix))) {
+    return { error: "retract only reaches the discord-live layer and the rag/ mirrors of D1 rows; the vault proper is not retractable here" };
+  }
+  return { path };
+}
+
+/** The two store calls a retract needs (VectorStore satisfies it; tests pass a real one too). */
+export interface RetractableStore {
+  countByPath(vaultPath: string): number;
+  deleteByPath(vaultPath: string): void;
+}
+
+/**
+ * THE delete path for a retracted document: every row at the path, its ANN vectors and (via the
+ * embeddings_ad trigger) its FTS rows. Returns how many rows were removed; 0 = nothing was there.
+ * POST /retract and the recall reconcile (ingestion/recall-reconcile.ts) both call this, so the two
+ * can never disagree on what "gone" means.
+ */
+export function retractPath(store: RetractableStore, vaultPath: string): number {
+  const before = store.countByPath(vaultPath);
+  if (before > 0) store.deleteByPath(vaultPath);
+  return before;
+}
+
+/** The rag/ mirror path of a companion_journal row, exactly as the ingestion pipeline writes it. */
+export function journalMirrorPath(id: string | number): string {
+  return `rag/companion_journal/${id}`;
+}
+
+/**
+ * The rag/ mirror path of a wm_continuity_notes row (2026-10-13), exactly as the ingestion pipeline writes
+ * it: the source type IS the table name, as with companion_journal, so the existing RETRACTABLE prefix
+ * `rag/wm_continuity_notes/` already covers a hand retraction of one.
+ */
+export function continuityMirrorPath(id: string | number): string {
+  return `rag/wm_continuity_notes/${id}`;
+}
+/** The rag/ mirror path of a ledger_entries row, exactly as the ingestion pipeline writes it (2026-09-26). */
+export function ledgerMirrorPath(id: string | number): string {
+  return `rag/ledger/${id}`;
+}
